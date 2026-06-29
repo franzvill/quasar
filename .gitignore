@@ -1,0 +1,7 @@
+*.o
+*.dSYM/
+/quasar
+/quasar-server
+*.gguf
+/gguf/
+.DS_Store
