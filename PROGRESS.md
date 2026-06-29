@@ -35,9 +35,26 @@ All verified on the real Qwen3-30B-A3B weights.
 | + KV cache (#8) | 9.7 s | each token is one incremental step, not a full re-run |
 | + batched dispatch (#6) | **4.3 s** | far fewer blocking CPU↔GPU round-trips |
 
-Sustained generation measured at **~6–10 tokens/sec** with coherent output, e.g.
-`Once upon a time, there was a 12-year-old boy who was very interested in the
-history of the world...`
+Decode tokens/sec (steady-state, startup amortized), M5 Pro, 2-bit model:
+
+| Stage | tok/s |
+|---|---:|
+| KV-cache hybrid | 9.7 |
+| + GPU MoE block (router/top-8/experts/SwiGLU in one command buffer) | 13.9 |
+| + GPU attention block (rmsnorm/QK-norm/RoPE/attention in one command buffer) | 27.6 |
+| + full resident forward (whole token in ONE command buffer, 1 sync/token) | **46.1** |
+
+The whole token — all 48 layers of attention + MoE + residuals + final norm/output
+— now runs in a single GPU command buffer (1 sync/token, down from ~1392 dispatches
+in the first naive hybrid), with cur and the KV cache GPU-resident; the CPU only
+embeds the token and reads the logits. Output stays exact vs the CPU oracle ("Paris") and
+coherent, e.g. `The meaning of life is a question that has long been pondered by
+philosophers, theologians, and scientists`.
+
+Gotcha that bit us: weight byte-offsets in kernel arg structs must be **uint64** —
+a norm tensor >4 GB into a chunk overflowed a uint32 `w_off`, read garbage, and
+produced NaN logits (output collapsed to "!!!!"). The matmul/MoE paths were already
+uint64, so only the new attention-norm structs were affected.
 
 ## Key technical decisions & gotchas
 

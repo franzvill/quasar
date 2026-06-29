@@ -21,4 +21,8 @@ void quasar_kv_reset(quasar_ctx *c);
  * (size hp.n_vocab). Use n = prompt length for prefill, then n = 1 per token. */
 void quasar_decode(quasar_ctx *c, const int32_t *ids, int n, float *logits_out);
 
+/* Phase profiling: reset accumulators, then dump ms/token after a decode run. */
+void quasar_profile_reset(void);
+void quasar_profile_dump(int n_tokens);
+
 #endif /* QUASAR_FORWARD_CPU_H */

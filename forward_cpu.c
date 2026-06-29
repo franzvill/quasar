@@ -12,6 +12,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
+#include <time.h>
+
+/* ---- lightweight phase profiling (summed wall time per decode phase) --- */
+static double pnow(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
+static double g_t_qkv, g_t_attn, g_t_attno, g_t_router, g_t_moe, g_t_out;
+void quasar_profile_reset(void) { g_t_qkv = g_t_attn = g_t_attno = g_t_router = g_t_moe = g_t_out = 0.0; }
+void quasar_profile_dump(int ntok) {
+    double tot = g_t_qkv + g_t_attn + g_t_attno + g_t_router + g_t_moe + g_t_out;
+    if (tot <= 0) tot = 1e-9;
+    if (ntok < 1) ntok = 1;
+    double k = 1e3 / ntok;  /* seconds-sum -> ms per token */
+    printf("== decode phase profile (ms/token over %d tokens) ==\n", ntok);
+    printf("  qkv   (gpu) %6.2f  (%4.1f%%)\n", g_t_qkv*k,    100*g_t_qkv/tot);
+    printf("  attn  (cpu) %6.2f  (%4.1f%%)\n", g_t_attn*k,   100*g_t_attn/tot);
+    printf("  attn_o(gpu) %6.2f  (%4.1f%%)\n", g_t_attno*k,  100*g_t_attno/tot);
+    printf("  router      %6.2f  (%4.1f%%)\n", g_t_router*k, 100*g_t_router/tot);
+    printf("  moe   (gpu) %6.2f  (%4.1f%%)\n", g_t_moe*k,    100*g_t_moe/tot);
+    printf("  output(gpu) %6.2f  (%4.1f%%)\n", g_t_out*k,    100*g_t_out/tot);
+    printf("  TOTAL       %6.2f\n", tot*k);
+}
 
 struct quasar_ctx {
     quasar_model *m;
@@ -33,7 +54,11 @@ struct quasar_ctx {
     float *moe_buf;  /* batched gate|up output: 2*n_expert_used*n_ff_exp */
     float *hid8;     /* silu(gate)*up for all selected experts */
     float *down_out; /* batched down output: n_expert_used*n_embd */
+    quasar_fwd_cfg     fwd_cfg;     /* resident-forward config (Metal) */
+    quasar_layer_desc *fwd_layers;  /* per-layer weight offsets (Metal) */
 };
+
+static uint64_t row0_of(quasar_ctx *c, const gguf_tensor *W, size_t elem_base);
 
 quasar_ctx *quasar_ctx_new(quasar_model *m, int max_seq, int use_metal) {
     quasar_hparams *h = &m->hp;
@@ -62,6 +87,33 @@ quasar_ctx *quasar_ctx_new(quasar_model *m, int max_seq, int use_metal) {
     c->moe_buf = malloc((size_t)2 * h->n_expert_used * h->n_ff_exp * sizeof(float));
     c->hid8    = malloc((size_t)h->n_expert_used * h->n_ff_exp * sizeof(float));
     c->down_out= malloc((size_t)h->n_expert_used * E * sizeof(float));
+
+    if (use_metal) {
+        c->fwd_layers = malloc((size_t)h->n_layer * sizeof(quasar_layer_desc));
+        for (uint32_t il = 0; il < h->n_layer; il++) {
+            quasar_layer *L = &m->layers[il];
+            quasar_layer_desc *D = &c->fwd_layers[il];
+            D->attn_norm = row0_of(c, L->attn_norm, 0);
+            D->q = row0_of(c, L->attn_q, 0); D->k = row0_of(c, L->attn_k, 0);
+            D->v = row0_of(c, L->attn_v, 0); D->o = row0_of(c, L->attn_o, 0);
+            D->q_norm = row0_of(c, L->attn_q_norm, 0); D->k_norm = row0_of(c, L->attn_k_norm, 0);
+            D->q_type = L->attn_q->type; D->k_type = L->attn_k->type;
+            D->v_type = L->attn_v->type; D->o_type = L->attn_o->type;
+            D->ffn_norm = row0_of(c, L->ffn_norm, 0);
+            D->router = row0_of(c, L->ffn_gate_inp, 0); D->router_type = L->ffn_gate_inp->type;
+            D->gate = row0_of(c, L->ffn_gate_exps, 0); D->up = row0_of(c, L->ffn_up_exps, 0);
+            D->down = row0_of(c, L->ffn_down_exps, 0); D->expert_type = L->ffn_gate_exps->type;
+            D->expert_bytes = (uint64_t)E * h->n_ff_exp / 256 * 84;
+        }
+        c->fwd_cfg = (quasar_fwd_cfg){
+            .output_norm = row0_of(c, m->output_norm, 0), .output = row0_of(c, m->output, 0),
+            .output_type = m->output->type,
+            .E = E, .H = (int)h->n_head, .HK = (int)h->n_head_kv, .HD = (int)h->head_dim,
+            .FF = (int)h->n_ff_exp, .NE = (int)h->n_expert, .NU = (int)h->n_expert_used,
+            .n_layer = (int)h->n_layer, .max_seq = max_seq, .n_vocab = (int)h->n_vocab,
+            .eps = h->rms_eps, .theta = h->rope_theta, .norm_topk = h->norm_topk_prob ? 1 : 0,
+        };
+    }
     return c;
 }
 
@@ -71,6 +123,7 @@ void quasar_ctx_free(quasar_ctx *c) {
     free(c->scores); free(c->router); free(c->gate); free(c->up); free(c->hid);
     free(c->moe_y); free(c->tmp); free(c->scratch);
     free(c->qkv_out); free(c->moe_buf); free(c->hid8); free(c->down_out);
+    free(c->fwd_layers);
     free(c);
 }
 
@@ -152,6 +205,17 @@ void quasar_decode(quasar_ctx *c, const int32_t *ids, int n, float *logits) {
     const int gsize = H / HK;
     const size_t KVL = (size_t)c->max_seq * HK * HD;   /* per-layer stride */
 
+    /* Metal: whole token in one GPU command buffer (resident cur + KV cache). */
+    if (c->use_metal) {
+        for (int t = 0; t < n; t++) {
+            int pos = c->n_past + t;
+            embed_token(c, ids[t], c->x);
+            quasar_metal_forward_token(&c->fwd_cfg, c->fwd_layers, pos, c->x, (t == n - 1) ? logits : NULL);
+        }
+        c->n_past += n;
+        return;
+    }
+
     for (int t = 0; t < n; t++) {
         int pos = c->n_past + t;
         float *cur = c->x;
@@ -161,81 +225,78 @@ void quasar_decode(quasar_ctx *c, const int32_t *ids, int n, float *logits) {
             quasar_layer *L = &m->layers[il];
             float *Kl = c->Kc + (size_t)il * KVL;
             float *Vl = c->Vc + (size_t)il * KVL;
+            double _t = pnow();
 
-            /* attention */
-            rmsnorm(cur, (const float *)L->attn_norm->data, E, eps, c->xn);
-            float *kt = Kl + (size_t)pos * HK * HD;
-            float *vt = Vl + (size_t)pos * HK * HD;
+            /* attention — one GPU command buffer on Metal, CPU reference otherwise */
             if (c->use_metal) {
-                int QHD = H * HD, KVD = HK * HD;
-                quasar_gemv_job jb[3] = {
-                    { L->attn_q->type, row0_of(c, L->attn_q, 0), 0, 0,                       E, QHD },
-                    { L->attn_k->type, row0_of(c, L->attn_k, 0), 0, (uint32_t)QHD,           E, KVD },
-                    { L->attn_v->type, row0_of(c, L->attn_v, 0), 0, (uint32_t)(QHD + KVD),   E, KVD },
+                quasar_attn_desc ad = {
+                    .attn_norm = row0_of(c, L->attn_norm, 0),
+                    .q = row0_of(c, L->attn_q, 0), .k = row0_of(c, L->attn_k, 0),
+                    .v = row0_of(c, L->attn_v, 0), .o = row0_of(c, L->attn_o, 0),
+                    .q_norm = row0_of(c, L->attn_q_norm, 0), .k_norm = row0_of(c, L->attn_k_norm, 0),
+                    .q_type = L->attn_q->type, .k_type = L->attn_k->type,
+                    .v_type = L->attn_v->type, .o_type = L->attn_o->type,
+                    .E = E, .H = H, .HK = HK, .HD = HD,
+                    .n_layer = (int)h->n_layer, .max_seq = c->max_seq, .layer = (int)il,
+                    .eps = eps, .theta = h->rope_theta,
                 };
-                quasar_metal_gemv_batch(jb, 3, c->xn, E, c->qkv_out, QHD + 2 * KVD);
-                memcpy(c->q, c->qkv_out,             (size_t)QHD * sizeof(float));
-                memcpy(kt,   c->qkv_out + QHD,       (size_t)KVD * sizeof(float));
-                memcpy(vt,   c->qkv_out + QHD + KVD, (size_t)KVD * sizeof(float));
+                quasar_metal_attn(&ad, cur, pos);
             } else {
+                rmsnorm(cur, (const float *)L->attn_norm->data, E, eps, c->xn);
+                float *kt = Kl + (size_t)pos * HK * HD;
+                float *vt = Vl + (size_t)pos * HK * HD;
                 gemv(L->attn_q, 0, c->xn, E, H  * HD, c->q, c);
                 gemv(L->attn_k, 0, c->xn, E, HK * HD, kt,   c);
                 gemv(L->attn_v, 0, c->xn, E, HK * HD, vt,   c);
-            }
-            for (int hh = 0; hh < H;  hh++) { rmsnorm(c->q + hh * HD, (const float *)L->attn_q_norm->data, HD, eps, c->q + hh * HD); rope_neox(c->q + hh * HD, HD, pos, h->rope_theta); }
-            for (int hh = 0; hh < HK; hh++) { rmsnorm(kt   + hh * HD, (const float *)L->attn_k_norm->data, HD, eps, kt   + hh * HD); rope_neox(kt   + hh * HD, HD, pos, h->rope_theta); }
-
-            for (int hh = 0; hh < H; hh++) {
-                int kvh = hh / gsize;
-                float *qh = c->q + hh * HD;
-                for (int s = 0; s <= pos; s++) {
-                    const float *ks = Kl + (size_t)s * HK * HD + kvh * HD;
-                    float dot = 0.0f;
-                    for (int d = 0; d < HD; d++) dot += qh[d] * ks[d];
-                    c->scores[s] = dot * scale;
+                for (int hh = 0; hh < H;  hh++) { rmsnorm(c->q + hh * HD, (const float *)L->attn_q_norm->data, HD, eps, c->q + hh * HD); rope_neox(c->q + hh * HD, HD, pos, h->rope_theta); }
+                for (int hh = 0; hh < HK; hh++) { rmsnorm(kt   + hh * HD, (const float *)L->attn_k_norm->data, HD, eps, kt   + hh * HD); rope_neox(kt   + hh * HD, HD, pos, h->rope_theta); }
+                for (int hh = 0; hh < H; hh++) {
+                    int kvh = hh / gsize;
+                    float *qh = c->q + hh * HD;
+                    for (int s = 0; s <= pos; s++) {
+                        const float *ks = Kl + (size_t)s * HK * HD + kvh * HD;
+                        float dot = 0.0f;
+                        for (int d = 0; d < HD; d++) dot += qh[d] * ks[d];
+                        c->scores[s] = dot * scale;
+                    }
+                    softmax(c->scores, pos + 1);
+                    float *ah = c->att + hh * HD;
+                    for (int d = 0; d < HD; d++) ah[d] = 0.0f;
+                    for (int s = 0; s <= pos; s++) {
+                        const float *vs = Vl + (size_t)s * HK * HD + kvh * HD;
+                        float w = c->scores[s];
+                        for (int d = 0; d < HD; d++) ah[d] += w * vs[d];
+                    }
                 }
-                softmax(c->scores, pos + 1);
-                float *ah = c->att + hh * HD;
-                for (int d = 0; d < HD; d++) ah[d] = 0.0f;
-                for (int s = 0; s <= pos; s++) {
-                    const float *vs = Vl + (size_t)s * HK * HD + kvh * HD;
-                    float w = c->scores[s];
-                    for (int d = 0; d < HD; d++) ah[d] += w * vs[d];
-                }
+                gemv(L->attn_o, 0, c->att, H * HD, E, c->tmp, c);
+                for (int i = 0; i < E; i++) cur[i] += c->tmp[i];
             }
-            gemv(L->attn_o, 0, c->att, H * HD, E, c->tmp, c);
-            for (int i = 0; i < E; i++) cur[i] += c->tmp[i];
+            g_t_qkv += pnow() - _t; _t = pnow();
 
-            /* MoE */
+            /* MoE — one GPU command buffer (router+topk+experts) on Metal */
             rmsnorm(cur, (const float *)L->ffn_norm->data, E, eps, c->xn);
-            gemv(L->ffn_gate_inp, 0, c->xn, E, NE, c->router, c);
-            softmax(c->router, NE);
-            int idx[64]; float wt[64];
-            unsigned char taken[256] = {0};
-            for (int s = 0; s < NU; s++) {
-                int bi = -1; float best = -1e30f;
-                for (int e = 0; e < NE; e++) if (!taken[e] && c->router[e] > best) { best = c->router[e]; bi = e; }
-                idx[s] = bi; wt[s] = c->router[bi]; taken[bi] = 1;
-            }
-            if (h->norm_topk_prob) { float sm = 0; for (int s = 0; s < NU; s++) sm += wt[s]; if (sm > 0) for (int s = 0; s < NU; s++) wt[s] /= sm; }
-            size_t gpe = (size_t)E * FF, dpe = (size_t)FF * E;
             for (int i = 0; i < E; i++) c->moe_y[i] = 0.0f;
             if (c->use_metal) {
-                quasar_gemv_job gj[16];
-                for (int s = 0; s < NU; s++) {
-                    gj[s]      = (quasar_gemv_job){ L->ffn_gate_exps->type, row0_of(c, L->ffn_gate_exps, (size_t)idx[s] * gpe), 0, (uint32_t)(s * FF),        E, FF };
-                    gj[NU + s] = (quasar_gemv_job){ L->ffn_up_exps->type,   row0_of(c, L->ffn_up_exps,   (size_t)idx[s] * gpe), 0, (uint32_t)((NU + s) * FF), E, FF };
-                }
-                quasar_metal_gemv_batch(gj, 2 * NU, c->xn, E, c->moe_buf, 2 * NU * FF);
-                for (int s = 0; s < NU; s++)
-                    for (int i = 0; i < FF; i++)
-                        c->hid8[s * FF + i] = silu(c->moe_buf[s * FF + i]) * c->moe_buf[(NU + s) * FF + i];
-                quasar_gemv_job dj[8];
-                for (int s = 0; s < NU; s++)
-                    dj[s] = (quasar_gemv_job){ L->ffn_down_exps->type, row0_of(c, L->ffn_down_exps, (size_t)idx[s] * dpe), (uint32_t)(s * FF), (uint32_t)(s * E), FF, E };
-                quasar_metal_gemv_batch(dj, NU, c->hid8, NU * FF, c->down_out, NU * E);
-                for (int s = 0; s < NU; s++) { float w = wt[s]; for (int i = 0; i < E; i++) c->moe_y[i] += w * c->down_out[s * E + i]; }
+                quasar_moe_desc d = {
+                    .router_row0 = row0_of(c, L->ffn_gate_inp, 0),  .router_type = L->ffn_gate_inp->type,
+                    .gate_row0   = row0_of(c, L->ffn_gate_exps, 0), .up_row0 = row0_of(c, L->ffn_up_exps, 0),
+                    .down_row0   = row0_of(c, L->ffn_down_exps, 0), .expert_type = L->ffn_gate_exps->type,
+                    .expert_bytes = (uint64_t)E * FF / 256 * 84,
+                    .E = E, .FF = FF, .NE = NE, .NU = NU, .norm_topk = h->norm_topk_prob,
+                };
+                quasar_metal_moe(&d, c->xn, c->moe_y);
             } else {
+                gemv(L->ffn_gate_inp, 0, c->xn, E, NE, c->router, c);
+                softmax(c->router, NE);
+                int idx[64]; float wt[64];
+                unsigned char taken[256] = {0};
+                for (int s = 0; s < NU; s++) {
+                    int bi = -1; float best = -1e30f;
+                    for (int e = 0; e < NE; e++) if (!taken[e] && c->router[e] > best) { best = c->router[e]; bi = e; }
+                    idx[s] = bi; wt[s] = c->router[bi]; taken[bi] = 1;
+                }
+                if (h->norm_topk_prob) { float sm = 0; for (int s = 0; s < NU; s++) sm += wt[s]; if (sm > 0) for (int s = 0; s < NU; s++) wt[s] /= sm; }
+                size_t gpe = (size_t)E * FF, dpe = (size_t)FF * E;
                 for (int s = 0; s < NU; s++) {
                     int e = idx[s]; float w = wt[s];
                     gemv(L->ffn_gate_exps, (size_t)e * gpe, c->xn, E, FF, c->gate, c);
@@ -246,11 +307,14 @@ void quasar_decode(quasar_ctx *c, const int32_t *ids, int n, float *logits) {
                 }
             }
             for (int i = 0; i < E; i++) cur[i] += c->moe_y[i];
+            g_t_moe += pnow() - _t;
         }
 
         if (t == n - 1 && logits) {
+            double _to = pnow();
             rmsnorm(cur, (const float *)m->output_norm->data, E, eps, c->xn);
             gemv(m->output, 0, c->xn, E, NV, logits, c);
+            g_t_out += pnow() - _to;
         }
     }
     c->n_past += n;

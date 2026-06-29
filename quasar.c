@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <unistd.h>
+#include <time.h>
 
 /* ---- hparams ---------------------------------------------------------- */
 
@@ -352,6 +353,75 @@ static int cmd_generate(const char *path, const char *prompt, int n_new, int use
     return 0;
 }
 
+/* ---- bench (steady-state decode tok/s) -------------------------------- */
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int cmd_bench(const char *path, int n_new, int use_metal, const char *prompt) {
+    if (n_new <= 0)  n_new  = 64;
+    if (!prompt)     prompt = "The capital of France is";
+    char err[256];
+    double t0 = now_s();
+    quasar_model *m = quasar_model_load(path, err, sizeof err);
+    if (!m) { fprintf(stderr, "quasar: load: %s\n", err); return 1; }
+    if (m->missing_tensors) { fprintf(stderr, "quasar: model incomplete (%d tensors missing)\n", m->missing_tensors); quasar_model_free(m); return 1; }
+    quasar_tokenizer *tk = quasar_tokenizer_load(m->gguf, err, sizeof err);
+    if (!tk) { fprintf(stderr, "quasar: tokenizer: %s\n", err); quasar_model_free(m); return 1; }
+
+    size_t np = 0;
+    int32_t *pids = quasar_tokenize(tk, prompt, strlen(prompt), false, &np);
+    if (np == 0) { fprintf(stderr, "quasar: empty prompt\n"); return 1; }
+    int NV = (int)m->hp.n_vocab;
+    int max_seq = (int)np + n_new + 16;
+
+    int metal_ready = 0;
+    if (use_metal) {
+        if (quasar_metal_init() == 0 && quasar_metal_set_weights(m->gguf->map, m->gguf->map_size) == 0)
+            metal_ready = 1;
+        else fprintf(stderr, "quasar: Metal unavailable; using CPU\n");
+    }
+    quasar_ctx *ctx = quasar_ctx_new(m, max_seq, metal_ready);
+    float *logits = malloc((size_t)NV * sizeof(float));
+    double t_loaded = now_s();
+
+    /* Warm-up: prefill + a few decode steps to page in the working set and warm GPU pipelines. */
+    quasar_kv_reset(ctx);
+    quasar_decode(ctx, pids, (int)np, logits);
+    const int warm = 8;
+    for (int s = 0; s < warm; s++) { int32_t one = argmax(logits, NV); quasar_decode(ctx, &one, 1, logits); }
+    double t_warm = now_s();
+
+    /* Measured steady-state decode: single-token steps. */
+    quasar_profile_reset();
+    double t_dec0 = now_s();
+    for (int s = 0; s < n_new; s++) { int32_t one = argmax(logits, NV); quasar_decode(ctx, &one, 1, logits); }
+    double t_dec1 = now_s();
+    double dec_s = t_dec1 - t_dec0;
+
+    /* Isolated prefill on a fresh KV (pages already resident). */
+    quasar_kv_reset(ctx);
+    double t_pf0 = now_s();
+    quasar_decode(ctx, pids, (int)np, logits);
+    double t_pf1 = now_s();
+
+    printf("== bench ==\n");
+    printf("model:    %s\n", path);
+    printf("backend:  %s\n", metal_ready ? "Metal (Apple GPU)" : "CPU reference");
+    printf("load:     %.2f s (mmap + set_weights, includes cold page-in)\n", t_loaded - t0);
+    printf("warmup:   %.2f s (prefill %zu + %d decode)\n", t_warm - t_loaded, np, warm);
+    printf("prefill:  %.1f tok/s  (%zu tok / %.3f s)\n", (double)np / (t_pf1 - t_pf0), np, t_pf1 - t_pf0);
+    printf("DECODE:   %.2f tok/s  (%d tok / %.3f s = %.2f ms/tok)\n", (double)n_new / dec_s, n_new, dec_s, dec_s / n_new * 1e3);
+    quasar_profile_dump(n_new);
+
+    free(logits);
+    quasar_ctx_free(ctx); quasar_tokenizer_free(tk); quasar_model_free(m);
+    return 0;
+}
+
 static int cmd_render(const char *path) {
     quasar_msg msgs[2] = {
         { "system", "You are a helpful assistant." },
@@ -474,6 +544,7 @@ static void usage(void) {
         "  quasar detokenize <model.gguf> <id>...   decode token ids -> text\n"
         "  quasar render [model.gguf]               show the Qwen3 ChatML template\n"
         "  quasar generate <model.gguf> \"text\" [n] [metal]  forward: top-5 + greedy n (add 'metal' for GPU)\n"
+        "  quasar bench <model.gguf> [n] [metal] [\"text\"]   steady-state decode tok/s (warmup + timed)\n"
         "  quasar metal-selftest [model.gguf]       validate Metal gemv kernels vs CPU\n"
         "  quasar requant <in.gguf> <out.gguf>      crush routed experts to 2-bit (Q2_K), keep the rest\n"
         "  quasar <model.gguf>                      shorthand for inspect\n"
@@ -506,6 +577,16 @@ int main(int argc, char **argv) {
         int nt = 0, um = 0;
         for (int i = 4; i < argc; i++) { if (strcmp(argv[i], "metal") == 0) um = 1; else nt = atoi(argv[i]); }
         return cmd_generate(argv[2], argv[3], nt, um);
+    }
+    if (strcmp(cmd, "bench") == 0) {
+        if (argc < 3) { fprintf(stderr, "usage: quasar bench <model.gguf> [n_tokens] [metal] [\"prompt\"]\n"); return 1; }
+        int nt = 0, um = 0; const char *bp = NULL;
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "metal") == 0) um = 1;
+            else if (atoi(argv[i]) > 0) nt = atoi(argv[i]);
+            else bp = argv[i];
+        }
+        return cmd_bench(argv[2], nt, um, bp);
     }
     if (strcmp(cmd, "metal-selftest") == 0) {
         return cmd_metal_selftest(argc >= 3 ? argv[2] : NULL);
