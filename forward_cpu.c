@@ -196,6 +196,12 @@ static void embed_token(quasar_ctx *c, int32_t id, float *dst) {
 
 void quasar_kv_reset(quasar_ctx *c) { c->n_past = 0; }
 
+void quasar_kv_seek(quasar_ctx *c, int pos) {
+    if (pos < 0) pos = 0;
+    if (pos > c->max_seq) pos = c->max_seq;
+    c->n_past = pos;
+}
+
 void quasar_decode(quasar_ctx *c, const int32_t *ids, int n, float *logits) {
     quasar_model *m = c->m;
     quasar_hparams *h = &m->hp;
