@@ -5,6 +5,8 @@
 #include "metal.h"
 #include "gguf.h"
 #include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* ---- Metal Shading Language kernels (compiled at runtime) ------------- */
 /* One thread per output row: dequantize that row's blocks and dot with x.
@@ -31,7 +33,9 @@ static const char *MSL =
 "  return uchar2(d, m);\n"
 "}\n"
 "kernel void matvec_q4k(device const uchar* W [[buffer(0)]], device const float* x [[buffer(1)]],\n"
-"                       device float* y [[buffer(2)]], constant gemv_args& a [[buffer(3)]], uint r [[thread_position_in_grid]]) {\n"
+"                       device float* y [[buffer(2)]], constant gemv_args& a [[buffer(3)]],\n"
+"                       uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
+"  uint r = gid >> 5;                       /* one 32-lane SIMD-group per output row */\n"
 "  if (r >= a.n_out) return;\n"
 "  device const uchar* row = W + a.row_base + (ulong)r * a.row_bytes;\n"
 "  device const float* xx = x + a.x_off; float acc = 0.0f; uint nb = a.n_in / 256;\n"
@@ -39,43 +43,44 @@ static const char *MSL =
 "    device const uchar* b = row + (ulong)i * 144;\n"
 "    float d = float(*(device const half*)(b)); float dmin = float(*(device const half*)(b + 2));\n"
 "    device const uchar* scales = b + 4; device const uchar* qbase = b + 16; uint xo = i * 256;\n"
-"    for (uint jj = 0; jj < 4; jj++) {\n"
-"      uint j = jj * 64; uint is = jj * 2;\n"
-"      uchar2 s0 = gsmk4(is + 0, scales); uchar2 s1 = gsmk4(is + 1, scales);\n"
+"    for (uint k = 0; k < 4; k++) {          /* lane reads bytes lane, lane+32, lane+64, lane+96 (coalesced) */\n"
+"      uint bi = lane + 32 * k; uint g = bi >> 5; uint l = bi & 31; uchar v = qbase[bi];\n"
+"      uchar2 s0 = gsmk4(2 * g + 0, scales); uchar2 s1 = gsmk4(2 * g + 1, scales);\n"
 "      float d1 = d*float(s0.x), m1 = dmin*float(s0.y); float d2 = d*float(s1.x), m2 = dmin*float(s1.y);\n"
-"      device const uchar* q = qbase + jj * 32;\n"
-"      for (uint l = 0; l < 32; l++) acc += (d1 * float(q[l] & 0xF) - m1) * xx[xo + j + l];\n"
-"      for (uint l = 0; l < 32; l++) acc += (d2 * float(q[l] >> 4)  - m2) * xx[xo + j + 32 + l];\n"
+"      acc += (d1 * float(v & 0xF) - m1) * xx[xo + 64 * g + l];\n"
+"      acc += (d2 * float(v >> 4)  - m2) * xx[xo + 64 * g + 32 + l];\n"
 "    }\n"
 "  }\n"
-"  y[a.y_off + r] = acc;\n"
+"  acc = simd_sum(acc);\n"
+"  if (lane == 0) y[a.y_off + r] = acc;\n"
 "}\n"
 "\n"
 "kernel void matvec_q6k(device const uchar* W [[buffer(0)]], device const float* x [[buffer(1)]],\n"
-"                       device float* y [[buffer(2)]], constant gemv_args& a [[buffer(3)]], uint r [[thread_position_in_grid]]) {\n"
+"                       device float* y [[buffer(2)]], constant gemv_args& a [[buffer(3)]],\n"
+"                       uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
+"  uint r = gid >> 5;                       /* one 32-lane SIMD-group per output row */\n"
 "  if (r >= a.n_out) return;\n"
 "  device const uchar* row = W + a.row_base + (ulong)r * a.row_bytes;\n"
-"  device const float* xx = x + a.x_off; float acc = 0.0f; uint nb = a.n_in / 256;\n"
+"  device const float* xx = x + a.x_off; float acc = 0.0f; uint nb = a.n_in / 256; uint l = lane;\n"
 "  for (uint i = 0; i < nb; i++) {\n"
 "    device const uchar* b  = row + (ulong)i * 210;\n"
 "    device const uchar* ql = b; device const uchar* qh = b + 128;\n"
 "    device const char*  sc = (device const char*)(b + 192); float d = float(*(device const half*)(b + 208)); uint xo = i * 256;\n"
 "    for (uint nn = 0; nn < 256; nn += 128) {\n"
-"      for (uint l = 0; l < 32; l++) {\n"
-"        uint is = l / 16;\n"
-"        int q1 = int((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;\n"
-"        int q2 = int((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;\n"
-"        int q3 = int((ql[l]      >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;\n"
-"        int q4 = int((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;\n"
-"        acc += d * float(sc[is + 0]) * float(q1) * xx[xo + nn + l];\n"
-"        acc += d * float(sc[is + 2]) * float(q2) * xx[xo + nn + l + 32];\n"
-"        acc += d * float(sc[is + 4]) * float(q3) * xx[xo + nn + l + 64];\n"
-"        acc += d * float(sc[is + 6]) * float(q4) * xx[xo + nn + l + 96];\n"
-"      }\n"
+"      uint is = l / 16;                      /* lane plays the role of l in 0..31 (coalesced) */\n"
+"      int q1 = int((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;\n"
+"      int q2 = int((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;\n"
+"      int q3 = int((ql[l]      >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;\n"
+"      int q4 = int((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;\n"
+"      acc += d * float(sc[is + 0]) * float(q1) * xx[xo + nn + l];\n"
+"      acc += d * float(sc[is + 2]) * float(q2) * xx[xo + nn + l + 32];\n"
+"      acc += d * float(sc[is + 4]) * float(q3) * xx[xo + nn + l + 64];\n"
+"      acc += d * float(sc[is + 6]) * float(q4) * xx[xo + nn + l + 96];\n"
 "      ql += 64; qh += 32; sc += 8;\n"
 "    }\n"
 "  }\n"
-"  y[a.y_off + r] = acc;\n"
+"  acc = simd_sum(acc);\n"
+"  if (lane == 0) y[a.y_off + r] = acc;\n"
 "}\n"
 "\n"
 "kernel void matvec_q2k(device const uchar* W [[buffer(0)]], device const float* x [[buffer(1)]],\n"
@@ -326,6 +331,13 @@ static id<MTLComputePipelineState> pso_for(uint32_t type) {
          : (type == GGML_TYPE_Q6_K) ? g_q6k : (type == GGML_TYPE_Q2_K) ? g_q2k : nil;
 }
 
+/* Matvec kernels rewritten to SIMD-group-per-row (32 lanes/row, simd_sum reduce):
+ * these dispatch n_out*32 threads instead of n_out. Add each kernel here as it is
+ * converted so every dispatch site launches it with the right grid. */
+static int is_simd_matvec(id<MTLComputePipelineState> pso) {
+    return pso == g_q4k || pso == g_q6k;
+}
+
 /* find the chunk fully containing [row0, row0+extent); -1 if none */
 static int chunk_for(uint64_t row0, uint64_t extent) {
     for (int i = 0; i < g_nchunks; i++)
@@ -354,8 +366,12 @@ void quasar_metal_gemv(uint32_t type, uint64_t row0, const float *x, int n_in, i
         [enc setBuffer:g_xbuf offset:0 atIndex:1];
         [enc setBuffer:g_ybuf offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof args atIndex:3];
-        NSUInteger tpt = pso.maxTotalThreadsPerThreadgroup; if (tpt > 256) tpt = 256;
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        if (is_simd_matvec(pso)) {
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)n_out * 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            NSUInteger tpt = pso.maxTotalThreadsPerThreadgroup; if (tpt > 256) tpt = 256;
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)n_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        }
         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
         memcpy(y, g_ybuf.contents, (size_t)n_out * sizeof(float));
     }
@@ -384,8 +400,12 @@ void quasar_metal_gemv_batch(const quasar_gemv_job *jobs, int nj,
             [enc setComputePipelineState:pso];
             [enc setBuffer:g_chunk[ci] offset:0 atIndex:0];
             [enc setBytes:&args length:sizeof args atIndex:3];
-            NSUInteger tpt = pso.maxTotalThreadsPerThreadgroup; if (tpt > 256) tpt = 256;
-            [enc dispatchThreads:MTLSizeMake((NSUInteger)J->n_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+            if (is_simd_matvec(pso)) {
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)J->n_out * 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                NSUInteger tpt = pso.maxTotalThreadsPerThreadgroup; if (tpt > 256) tpt = 256;
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)J->n_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+            }
         }
         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
         memcpy(out, g_ybuf.contents, (size_t)out_floats * sizeof(float));
@@ -414,6 +434,10 @@ static void ensure_moe(int E, int FF, int NE, int NU) {
 }
 
 static void disp(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso, NSUInteger n) {
+    if (is_simd_matvec(pso)) {   /* SIMD-group-per-row matvec: 32 lanes per output row */
+        [enc dispatchThreads:MTLSizeMake(n * 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return;
+    }
     NSUInteger tpt = pso.maxTotalThreadsPerThreadgroup;
     if (tpt > 256) tpt = 256;
     if (tpt > n) tpt = n;
@@ -701,6 +725,15 @@ void quasar_metal_forward_token(const quasar_fwd_cfg *cfg, const quasar_layer_de
     memcpy(r_cur.contents, embed, (size_t)E * 4);
     float scale = 1.0f / sqrtf((float)HD);
 
+    /* QUASAR_SKIP=attn|moe|out lets bench drop phases to profile their cost (read once). */
+    static int sk_attn = -1, sk_moe = -1, sk_out = -1;
+    if (sk_attn < 0) {
+        const char *skip = getenv("QUASAR_SKIP");
+        sk_attn = (skip && strstr(skip, "attn")) ? 1 : 0;
+        sk_moe  = (skip && strstr(skip, "moe"))  ? 1 : 0;
+        sk_out  = (skip && strstr(skip, "out"))  ? 1 : 0;
+    }
+
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -710,6 +743,7 @@ void quasar_metal_forward_token(const quasar_fwd_cfg *cfg, const quasar_layer_de
             uint32_t kv_off = (uint32_t)((uint64_t)il * cfg->max_seq * HK * HD);
             uint32_t slot   = kv_off + (uint32_t)((uint64_t)pos * HK * HD);
 
+            if (!sk_attn) {
             /* attention */
             enc_rmsnorm(enc, r_cur, r_xn, L->attn_norm, E, cfg->eps);
             enc_matvec(enc, L->q_type, L->q, 0, 0,    E, H  * HD, r_xn, r_q);
@@ -724,7 +758,9 @@ void quasar_metal_forward_token(const quasar_fwd_cfg *cfg, const quasar_layer_de
               [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)H,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)HD,1,1)]; }
             enc_matvec(enc, L->o_type, L->o, 0, 0, H * HD, E, r_att, r_tmp);
             enc_add(enc, r_cur, r_tmp, E);
+            }
 
+            if (!sk_moe) {
             /* MoE */
             enc_rmsnorm(enc, r_cur, r_xn, L->ffn_norm, E, cfg->eps);
             enc_matvec(enc, L->router_type, L->router, 0, 0, E, NE, r_xn, g_moe_router);
@@ -745,9 +781,10 @@ void quasar_metal_forward_token(const quasar_fwd_cfg *cfg, const quasar_layer_de
               [enc setBuffer:g_moe_y offset:0 atIndex:2]; [enc setBytes:pc length:sizeof pc atIndex:3];
               disp(enc, g_combine, (NSUInteger)E); }
             enc_add(enc, r_cur, g_moe_y, E);
+            }
         }
 
-        if (logits) {
+        if (logits && !sk_out) {
             enc_rmsnorm(enc, r_cur, r_xn, cfg->output_norm, E, cfg->eps);
             enc_matvec(enc, cfg->output_type, cfg->output, 0, 0, E, cfg->n_vocab, r_xn, r_logits);
         }

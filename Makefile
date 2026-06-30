@@ -14,14 +14,24 @@ ifeq ($(UNAME_S),Darwin)
   FRAMEWORKS = -framework Foundation -framework Metal
 endif
 
-OBJ = quasar.o gguf.o tokenizer.o chat.o quant.o forward_cpu.o metal.o requant.o
+OBJ = quasar.o gguf.o tokenizer.o chat.o quant.o forward_cpu.o metal.o requant.o \
+      json.o sample.o server.o
 
 all: quasar
 
 quasar: $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS) $(FRAMEWORKS)
 
-quasar.o: quasar.c quasar.h gguf.h tokenizer.h chat.h forward_cpu.h
+quasar.o: quasar.c quasar.h gguf.h tokenizer.h chat.h forward_cpu.h server.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+json.o: json.c json.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+sample.o: sample.c sample.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+server.o: server.c server.h quasar.h tokenizer.h chat.h forward_cpu.h metal.h sample.h json.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 chat.o: chat.c chat.h

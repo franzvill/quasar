@@ -10,6 +10,7 @@
 #include "quant.h"
 #include "metal.h"
 #include "requant.h"
+#include "server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +90,13 @@ quasar_model *quasar_model_load(const char *path, char *err, size_t errlen) {
     if (!m) { snprintf(err, errlen, "out of memory"); gguf_close(g); return NULL; }
     m->gguf = g;
     read_hparams(g, &m->hp);
+    /* QUASAR_TOPK overrides experts-used-per-token (e.g. 4 vs the trained 8) for a
+     * speed/quality A/B without re-encoding the model. */
+    const char *topk_env = getenv("QUASAR_TOPK");
+    if (topk_env) {
+        int v = atoi(topk_env);
+        if (v > 0 && v <= (int)m->hp.n_expert) m->hp.n_expert_used = (uint32_t)v;
+    }
 
     uint32_t L = m->hp.n_layer;
     m->layers = calloc(L ? L : 1, sizeof(quasar_layer));
@@ -532,6 +540,28 @@ static int cmd_requant(const char *in, const char *out) {
     return 0;
 }
 
+/* ---- serve (OpenAI-compatible HTTP server) ---------------------------- */
+
+static int cmd_serve(int argc, char **argv) {
+    /* argv[0] == "serve"; remaining args are the model path and flags. */
+    const char *model = NULL;
+    quasar_server_opts o = { .host = "127.0.0.1", .port = 8080, .ctx = 8192, .use_metal = 0 };
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if      (strcmp(a, "metal") == 0)                   o.use_metal = 1;
+        else if (strcmp(a, "--host") == 0 && i + 1 < argc)  o.host = argv[++i];
+        else if (strcmp(a, "--port") == 0 && i + 1 < argc)  o.port = atoi(argv[++i]);
+        else if (strcmp(a, "--ctx")  == 0 && i + 1 < argc)  o.ctx  = atoi(argv[++i]);
+        else if (a[0] != '-' && !model)                     model = a;
+        else { fprintf(stderr, "quasar: unknown serve argument: %s\n", a); return 1; }
+    }
+    if (!model) {
+        fprintf(stderr, "usage: quasar serve <model.gguf> [--host H] [--port N] [--ctx N] [metal]\n");
+        return 1;
+    }
+    return quasar_serve(model, &o);
+}
+
 /* ---- main ------------------------------------------------------------- */
 
 static void usage(void) {
@@ -547,6 +577,7 @@ static void usage(void) {
         "  quasar bench <model.gguf> [n] [metal] [\"text\"]   steady-state decode tok/s (warmup + timed)\n"
         "  quasar metal-selftest [model.gguf]       validate Metal gemv kernels vs CPU\n"
         "  quasar requant <in.gguf> <out.gguf>      crush routed experts to 2-bit (Q2_K), keep the rest\n"
+        "  quasar serve <model.gguf> [--host H] [--port N] [--ctx N] [metal]  OpenAI-compatible HTTP server\n"
         "  quasar <model.gguf>                      shorthand for inspect\n"
         "  quasar --help                            this help\n");
 }
@@ -594,6 +625,9 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "requant") == 0) {
         if (argc < 4) { fprintf(stderr, "usage: quasar requant <in.gguf> <out.gguf>\n"); return 1; }
         return cmd_requant(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "serve") == 0) {
+        return cmd_serve(argc - 1, &argv[1]);
     }
     return cmd_inspect(argv[1]);     /* default: treat the arg as a model path */
 }

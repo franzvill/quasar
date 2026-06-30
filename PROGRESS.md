@@ -25,6 +25,8 @@ All verified on the real Qwen3-30B-A3B weights.
 | 7 | **Asymmetric 2-bit expert quant** (`requant`) | ✅ | 18.6 GB → **10.5 GB**, fits 24 GB, still coherent |
 | 8 | KV cache → incremental decode | ✅ | identical output, O(T²)→O(T) |
 | 6 | Batched GPU dispatch (q/k/v, gate+up, down grouped) | ◐ | ~1392→240 syncs/token; full on-GPU glue still todo |
+| 9 | Sampling (temp / top-k / top-p / min-p / repeat penalty) | ✅ | greedy still exact; `seed` reproducible |
+| 10 | **OpenAI-compatible HTTP server** (`serve`) + SSE | ✅ | `/v1/chat/completions`, `/v1/completions`, `/v1/models` |
 
 ## Speed journey (14-token generation, M5 Pro, 2-bit model)
 
@@ -55,6 +57,35 @@ Gotcha that bit us: weight byte-offsets in kernel arg structs must be **uint64**
 a norm tensor >4 GB into a chunk overflowed a uint32 `w_off`, read garbage, and
 produced NaN logits (output collapsed to "!!!!"). The matmul/MoE paths were already
 uint64, so only the new attention-norm structs were affected.
+
+## Serving it (session of 2026-06-30)
+
+With decode fast and resident, the engine became usable as a drop-in local API.
+Two new zero-dependency modules, then an HTTP layer:
+
+- **`sample.{h,c}`** — greedy / temperature / top-k / top-p (nucleus) / min-p +
+  repetition penalty, with a seedable xorshift RNG. To avoid sorting all ~152k
+  logits per token, it prunes to a post-temperature 30-nat window first (anything
+  below contributes <1e-13 to the softmax) and sorts only the survivors. `temp ≤ 0`
+  is exact greedy, so the `" Paris"` parity check still holds.
+- **`json.{h,c}`** — a small recursive-descent JSON parser (objects/arrays, all
+  escapes incl. `\uXXXX` surrogate pairs) for request bodies, plus a growable
+  string builder + escaper for responses.
+- **`server.{h,c}`** — a minimal HTTP/1.1 server (`quasar serve`): `/v1/chat/
+  completions` (ChatML render → tokenize → decode loop) with **SSE streaming**,
+  `/v1/completions`, `/v1/models`, `/health`. Requests run **serially** (one model
+  / KV cache / GPU pipeline). The model is loaded once and warmed up at startup so
+  the first request is fast. Streaming holds back bytes on UTF-8 char boundaries
+  (so multibyte never splits across chunks) and on the longest `stop` string (so a
+  stop sequence is never partially emitted).
+
+Verified end to end against the 2-bit model on Metal: non-streaming chat returns
+`"Tokyo."` / `"…**Paris**."` with correct `usage`; streaming emits the role chunk,
+content deltas, the `finish_reason` chunk, then `data: [DONE]`; `stop`, `seed`,
+Japanese (multibyte) output, the legacy completion endpoint, and the 400/404/405
+error paths all behave. Sustained ~33 tok/s for a 200-token response (the ~46 tok/s
+figure is the pure marginal decode rate; per-request wall time also includes
+prefill).
 
 ## Key technical decisions & gotchas
 
@@ -92,14 +123,19 @@ make test-gguf                                    # tiny synthetic qwen3moe, no 
 ./quasar metal-selftest gguf/Qwen3-30B-A3B-Q4_K_M.gguf
 ./quasar requant      gguf/Qwen3-30B-A3B-Q4_K_M.gguf gguf/q2k.gguf   # make the 2-bit model
 ./quasar generate     gguf/q2k.gguf "Once upon a time" 40 metal      # generate on the GPU
+./quasar serve        gguf/q2k.gguf --port 8080 metal                # OpenAI-compatible API server
 ```
+
+## Done since the initial roadmap
+
+- ✅ **#6 fully GPU-resident forward** — the glue (RMSNorm, QK-norm, RoPE, attention,
+  softmax, MoE) is on Metal; a whole token runs in one command buffer → **46 tok/s**.
+- ✅ **Temperature / top-k / top-p / min-p sampling** (`sample.{h,c}`).
+- ✅ **OpenAI-compatible HTTP server** with SSE streaming (`serve`).
 
 ## Remaining roadmap
 
-- **#6 (finish):** fully GPU-resident forward — move the glue (RMSNorm, QK-norm,
-  RoPE, attention, softmax, MoE) onto Metal kernels, one command buffer per token,
-  activations resident → push toward tens of tokens/sec.
-- Temperature / min-p sampling; interactive CLI chat loop.
-- OpenAI-compatible HTTP server + Qwen3 tool calling.
+- Qwen3 **tool calling** over the server (parse `<tool_call>` blocks → `tool_calls`).
+- An interactive CLI chat loop (keeps the KV cache warm between turns).
 - KV-on-disk + SSD expert streaming (ds4's RAM↔SSD spectrum).
 - Quality: imatrix-calibrated 2-bit from F16 source; IQ2_XXS for gate/up.

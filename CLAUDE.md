@@ -32,7 +32,13 @@ make clean
 ./quasar generate      <model.gguf> "prompt" [n] [metal]  # forward: top-5 + greedy n tokens; add 'metal' for GPU
 ./quasar metal-selftest [model.gguf]                 # validate Metal gemv kernels vs the CPU oracle
 ./quasar requant       <in.gguf> <out.gguf>          # crush routed experts to Q2_K (the asymmetric quant)
+./quasar serve         <model.gguf> [--host H] [--port N] [--ctx N] [metal]  # OpenAI-compatible HTTP server
 ```
+
+The `serve` command starts an OpenAI-compatible HTTP server (`/v1/chat/completions`
+with SSE streaming, `/v1/completions`, `/v1/models`) so OpenAI clients and coding
+agents can point at it. It loads the model once, warms up, then serves requests
+**serially** (one model / KV cache / GPU pipeline → generations can't overlap).
 
 The binary always links Metal; CPU vs GPU is chosen per run (`generate` without
 `metal` uses the scalar CPU path — slow but the reference). There is no separate
@@ -64,6 +70,9 @@ Model files live in `gguf/` and are git-ignored.
 | `forward_cpu.{h,c}` | The forward pass + KV cache + incremental decode; `gemv` dispatches CPU or Metal |
 | `metal.{h,m}` | Metal backend: chunked zero-copy weight buffers + dequant-matvec kernels (single + batched) |
 | `requant.{h,c}` | GGUF writer: copy everything, requantize `*_exps` tensors to Q2_K |
+| `sample.{h,c}` | Token sampler: greedy / temperature / top-k / top-p / min-p + repeat penalty |
+| `json.{h,c}` | Zero-dep JSON parser (request bodies) + string builder/escaper (responses) |
+| `server.{h,c}` | OpenAI-compatible HTTP/1.1 server (chat/completions + SSE streaming) |
 | `tools/make_test_gguf.py` | Synthesizes a tiny but valid qwen3moe GGUF for testing without a download |
 
 Data flow for decode: `tokenizer` → `forward_cpu.quasar_decode` (per token, per
@@ -104,7 +113,8 @@ expert**, MoE gating = softmax over all experts → top-8 → renormalize.
 ## When extending
 
 Add a new milestone by implementing it behind the CPU oracle first, then porting to
-Metal and gating on parity. The current next step (`ARCHITECTURE.md` #6) is the
-fully GPU-resident forward: move RMSNorm/QK-norm/RoPE/attention/softmax/MoE into
-Metal kernels and run a whole token in one command buffer (today the glue is on the
-CPU and only the matmuls are on the GPU).
+Metal and gating on parity. The fully GPU-resident forward (`ARCHITECTURE.md` #6) is
+**done**: a whole token — all 48 layers + final projection — runs in one Metal
+command buffer (`quasar_metal_forward_token`), reaching ~46 tok/s steady-state
+decode. Sampling and the OpenAI server are also done. Remaining roadmap: Qwen3 tool
+calling, imatrix-calibrated 2-bit, and KV-on-disk / SSD expert streaming.
