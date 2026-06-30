@@ -126,6 +126,31 @@ static const char *MSL =
 "  for (uint s = 0; s < NU; s++) sel_w[s] /= wsum;\n"
 "}\n"
 "\n"
+"struct rtk_args { ulong row_base; uint n_in; uint ne; uint nu; };\n"
+"kernel void router_topk(device const uchar* W [[buffer(0)]], device const float* xn [[buffer(1)]],\n"
+"                        device int* sel_idx [[buffer(2)]], device float* sel_w [[buffer(3)]],\n"
+"                        constant rtk_args& a [[buffer(4)]], uint tid [[thread_position_in_threadgroup]]) {\n"
+"  threadgroup float logits[128];\n"
+"  uint NE = a.ne, NU = a.nu, E = a.n_in;\n"
+"  if (tid < NE) {\n"
+"    device const float* w = (device const float*)(W + a.row_base + (ulong)tid * (ulong)E * 4);\n"
+"    float acc = 0.0f; for (uint c = 0; c < E; c++) acc += w[c] * xn[c];\n"
+"    logits[tid] = acc;\n"
+"  }\n"
+"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  if (tid != 0) return;\n"
+"  float mx = logits[0]; for (uint i = 1; i < NE; i++) mx = max(mx, logits[i]);\n"
+"  float sum = 0.0f; for (uint i = 0; i < NE; i++) sum += exp(logits[i] - mx);\n"
+"  bool taken[128]; for (uint i = 0; i < NE; i++) taken[i] = false;\n"
+"  float wsum = 0.0f;\n"
+"  for (uint s = 0; s < NU; s++) {\n"
+"    int bi = -1; float best = -1e30f;\n"
+"    for (uint i = 0; i < NE; i++) if (!taken[i] && logits[i] > best) { best = logits[i]; bi = i; }\n"
+"    taken[bi] = true; sel_idx[s] = bi; float pr = exp(best - mx) / sum; sel_w[s] = pr; wsum += pr;\n"
+"  }\n"
+"  for (uint s = 0; s < NU; s++) sel_w[s] /= wsum;\n"
+"}\n"
+"\n"
 "kernel void matvec_q2k_expert(device const uchar* W [[buffer(0)]], device const float* x [[buffer(1)]],\n"
 "                              device float* y [[buffer(2)]], device const int* sel [[buffer(3)]],\n"
 "                              constant expert_args& a [[buffer(4)]], uint g [[thread_position_in_grid]]) {\n"
@@ -201,31 +226,51 @@ static const char *MSL =
 "}\n"
 "\n"
 "struct attn_args { uint n_head; uint n_head_kv; uint head_dim; uint pos; uint kv_off; float scale; };\n"
+/* Flash-style online softmax: positions are streamed in blocks, so the score array is
+ * bounded by BLK (not the full context -> no fixed ctx ceiling), and the softmax max/sum
+ * are parallel threadgroup reductions instead of a serial pass on thread 0. */
 "kernel void attention_k(device const float* q [[buffer(0)]], device const float* Kc [[buffer(1)]],\n"
 "                        device const float* Vc [[buffer(2)]], device float* att [[buffer(3)]],\n"
 "                        constant attn_args& a [[buffer(4)]], uint h [[threadgroup_position_in_grid]],\n"
 "                        uint tid [[thread_position_in_threadgroup]], uint tgs [[threads_per_threadgroup]]) {\n"
 "  uint HD = a.head_dim, HK = a.n_head_kv, gsize = a.n_head / HK, kvh = h / gsize;\n"
 "  device const float* qh = q + h*HD;\n"
-"  threadgroup float sc[4096];\n"
+"  const uint BLK = 2048;\n"
+"  threadgroup float sc[2048];   /* one block of scores */\n"
+"  threadgroup float sh[128];    /* reduction scratch */\n"
+"  threadgroup float acc[128];   /* running unnormalized output, one per dim (HD<=128) */\n"
+"  threadgroup float gm, gl;     /* running max, running sum */\n"
 "  uint P = a.pos + 1;\n"
-"  for (uint s = tid; s < P; s += tgs) {\n"
-"    device const float* ks = Kc + a.kv_off + s*HK*HD + kvh*HD;\n"
-"    float dot = 0.0f; for (uint d = 0; d < HD; d++) dot += qh[d]*ks[d];\n"
-"    sc[s] = dot * a.scale;\n"
-"  }\n"
+"  for (uint d = tid; d < HD; d += tgs) acc[d] = 0.0f;\n"
+"  if (tid == 0) { gm = -1e30f; gl = 0.0f; }\n"
 "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"  if (tid == 0) {\n"
-"    float mx = sc[0]; for (uint s = 1; s < P; s++) mx = max(mx, sc[s]);\n"
-"    float sum = 0.0f; for (uint s = 0; s < P; s++) { sc[s] = exp(sc[s]-mx); sum += sc[s]; }\n"
-"    float inv = 1.0f/sum; for (uint s = 0; s < P; s++) sc[s] *= inv;\n"
+"  for (uint b0 = 0; b0 < P; b0 += BLK) {\n"
+"    uint bn = min(BLK, P - b0);\n"
+"    for (uint i = tid; i < bn; i += tgs) {\n"
+"      device const float* ks = Kc + a.kv_off + (b0+i)*HK*HD + kvh*HD;\n"
+"      float dot = 0.0f; for (uint d = 0; d < HD; d++) dot += qh[d]*ks[d];\n"
+"      sc[i] = dot * a.scale;\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float lm = -1e30f; for (uint i = tid; i < bn; i += tgs) lm = max(lm, sc[i]);\n"
+"    sh[tid] = lm; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) sh[tid] = max(sh[tid], sh[tid+s]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"    float newm = max(gm, sh[0]);\n"
+"    float ls = 0.0f; for (uint i = tid; i < bn; i += tgs) { float e = exp(sc[i]-newm); sc[i] = e; ls += e; }\n"
+"    sh[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint s = tgs/2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"    float corr = exp(gm - newm);\n"
+"    for (uint d = tid; d < HD; d += tgs) {\n"
+"      float o = acc[d]*corr;\n"
+"      for (uint i = 0; i < bn; i++) o += sc[i]*Vc[a.kv_off + (b0+i)*HK*HD + kvh*HD + d];\n"
+"      acc[d] = o;\n"
+"    }\n"
+"    if (tid == 0) { gl = gl*corr + sh[0]; gm = newm; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 "  }\n"
-"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  float inv = 1.0f / gl;\n"
 "  device float* ah = att + h*HD;\n"
-"  for (uint d = tid; d < HD; d += tgs) {\n"
-"    float acc = 0.0f; for (uint s = 0; s < P; s++) acc += sc[s]*Vc[a.kv_off + s*HK*HD + kvh*HD + d];\n"
-"    ah[d] = acc;\n"
-"  }\n"
+"  for (uint d = tid; d < HD; d += tgs) ah[d] = acc[d]*inv;\n"
 "}\n"
 "\n"
 "kernel void add_k(device float* dst [[buffer(0)]], device const float* src [[buffer(1)]], uint i [[thread_position_in_grid]]) {\n"
@@ -241,7 +286,7 @@ typedef struct { uint64_t row_base; uint32_t n_in, n_out, row_bytes, x_off, y_of
 static id<MTLDevice>               g_dev;
 static id<MTLCommandQueue>         g_queue;
 static id<MTLComputePipelineState> g_f32, g_q4k, g_q6k, g_q2k;
-static id<MTLComputePipelineState> g_topk, g_expert, g_silu, g_combine;
+static id<MTLComputePipelineState> g_topk, g_rtk, g_expert, g_silu, g_combine;
 static id<MTLComputePipelineState> g_rms, g_qkr, g_attn, g_add;
 static id<MTLBuffer>               g_chunk[QM_MAX_CHUNKS];
 static uint64_t                    g_chunk_off[QM_MAX_CHUNKS];
@@ -275,6 +320,7 @@ int quasar_metal_init(void) {
         g_q6k = make_pso(lib, "matvec_q6k");
         g_q2k = make_pso(lib, "matvec_q2k");
         g_topk    = make_pso(lib, "topk_moe");
+        g_rtk     = make_pso(lib, "router_topk");
         g_expert  = make_pso(lib, "matvec_q2k_expert");
         g_silu    = make_pso(lib, "silu_mul");
         g_combine = make_pso(lib, "combine_moe");
@@ -282,7 +328,7 @@ int quasar_metal_init(void) {
         g_qkr     = make_pso(lib, "qknorm_rope_k");
         g_attn    = make_pso(lib, "attention_k");
         g_add     = make_pso(lib, "add_k");
-        if (!g_f32 || !g_q4k || !g_q6k || !g_q2k || !g_topk || !g_expert || !g_silu || !g_combine ||
+        if (!g_f32 || !g_q4k || !g_q6k || !g_q2k || !g_topk || !g_rtk || !g_expert || !g_silu || !g_combine ||
             !g_rms || !g_qkr || !g_attn || !g_add) return -3;
         g_ok = 1;
         return 0;
@@ -712,6 +758,24 @@ static void enc_expert(id<MTLComputeCommandEncoder> enc, uint64_t base, uint64_t
     disp(enc, g_expert, (NSUInteger)nu * n_out);
 }
 
+typedef struct { uint64_t row_base; uint32_t n_in, ne, nu; } rtk_args;
+
+/* fused router(F32 matvec) + softmax top-NU selection, one threadgroup of ne threads */
+static void enc_router_topk(id<MTLComputeCommandEncoder> enc, uint64_t router_row0,
+                            int E, int NE, int NU, id<MTLBuffer> xnb) {
+    uint64_t rb = (uint64_t)E * 4;            /* F32 router rows */
+    int ci = chunk_for(router_row0, (uint64_t)NE * rb);
+    if (ci < 0) { fprintf(stderr, "qf: router span no chunk\n"); return; }
+    rtk_args a = { router_row0 - g_chunk_off[ci], (uint32_t)E, (uint32_t)NE, (uint32_t)NU };
+    [enc setComputePipelineState:g_rtk];
+    [enc setBuffer:g_chunk[ci] offset:0 atIndex:0];
+    [enc setBuffer:xnb offset:0 atIndex:1];
+    [enc setBuffer:g_moe_sel offset:0 atIndex:2];
+    [enc setBuffer:g_moe_selw offset:0 atIndex:3];
+    [enc setBytes:&a length:sizeof a atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)NE,1,1)];
+}
+
 void quasar_metal_forward_token(const quasar_fwd_cfg *cfg, const quasar_layer_desc *layers,
                                 int pos, const float *embed, float *logits) {
     if (!g_ok || g_nchunks == 0) return;
@@ -763,12 +827,9 @@ void quasar_metal_forward_token(const quasar_fwd_cfg *cfg, const quasar_layer_de
             if (!sk_moe) {
             /* MoE */
             enc_rmsnorm(enc, r_cur, r_xn, L->ffn_norm, E, cfg->eps);
-            enc_matvec(enc, L->router_type, L->router, 0, 0, E, NE, r_xn, g_moe_router);
-            { uint32_t pk[2] = { (uint32_t)NE, (uint32_t)NU };
-              [enc setComputePipelineState:g_topk];
-              [enc setBuffer:g_moe_router offset:0 atIndex:0]; [enc setBuffer:g_moe_sel offset:0 atIndex:1];
-              [enc setBuffer:g_moe_selw offset:0 atIndex:2]; [enc setBytes:pk length:sizeof pk atIndex:3];
-              disp(enc, g_topk, 1); }
+            /* fused router F32 matvec + softmax top-NU select in one dispatch (one fewer
+             * dispatch + sync point per layer than the separate router+topk kernels) */
+            enc_router_topk(enc, L->router, E, NE, NU, r_xn);
             enc_expert(enc, L->gate, L->expert_bytes, E, FF, 0, (uint32_t)FF, NU, NE, r_xn, g_moe_gate);
             enc_expert(enc, L->up,   L->expert_bytes, E, FF, 0, (uint32_t)FF, NU, NE, r_xn, g_moe_up);
             { [enc setComputePipelineState:g_silu];
