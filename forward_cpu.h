@@ -16,6 +16,11 @@ void        quasar_ctx_free(quasar_ctx *c);
 /* Clear the KV cache (start a fresh sequence). */
 void quasar_kv_reset(quasar_ctx *c);
 
+/* Reuse a prefix of the KV cache: set n_past to `pos` (clamped to [0, max_seq]).
+ * The next quasar_decode appends at `pos`, so positions [0,pos) are kept. The caller
+ * must guarantee those positions hold K/V for the intended prefix tokens. */
+void quasar_kv_seek(quasar_ctx *c, int pos);
+
 /* Append n new tokens to the sequence (positions [n_past, n_past+n)), updating
  * the KV cache, and write logits for the LAST of them into logits_out
  * (size hp.n_vocab). Use n = prompt length for prefill, then n = 1 per token. */

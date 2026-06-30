@@ -44,6 +44,9 @@ typedef struct {
     int               use_metal;
     char              model_id[128];
     float            *logits;       /* [n_vocab] reused */
+    int32_t          *cached;       /* [max_seq] token ids currently in the KV cache */
+    int               n_cached;     /* == ctx n_past: how many positions are materialized */
+    int               last_reused;  /* prefix tokens reused on the most recent request */
     unsigned long     req_counter;
 } server_st;
 
@@ -223,8 +226,24 @@ static const char *run_generation(server_st *st, const int32_t *prompt, int n_pr
                                   int max_tokens, quasar_sampler *smp,
                                   char **stops, int n_stops,
                                   delta_cb cb, void *ud, strbuf *out_text, int *out_n) {
-    quasar_kv_reset(st->ctx);
-    quasar_decode(st->ctx, prompt, n_prompt, st->logits);
+    /* Prefix KV-cache reuse: keep the live cache across requests and re-prefill only
+     * the suffix that diverges from what's already materialized. Positions [0,reuse)
+     * hold identical tokens => identical K/V, so output is unchanged; we just skip
+     * recomputing them. Always re-decode at least the last prompt token so we have
+     * fresh logits to sample from. */
+    int reuse = 0;
+    while (reuse < n_prompt - 1 && reuse < st->n_cached && st->cached[reuse] == prompt[reuse])
+        reuse++;
+    st->last_reused = reuse;
+    quasar_kv_seek(st->ctx, reuse);
+    quasar_decode(st->ctx, prompt + reuse, n_prompt - reuse, st->logits);
+    /* mirror the cache contents: the prompt now occupies [0,n_prompt); generated
+     * tokens are appended as they are decoded back in below. */
+    {
+        int ncopy = n_prompt < st->max_seq ? n_prompt : st->max_seq;
+        memcpy(st->cached, prompt, (size_t)ncopy * sizeof(int32_t));
+        st->n_cached = ncopy;
+    }
 
     size_t hmax = 0;                                   /* longest stop string */
     for (int i = 0; i < n_stops; i++) { size_t l = strlen(stops[i]); if (l > hmax) hmax = l; }
@@ -273,6 +292,8 @@ static const char *run_generation(server_st *st, const int32_t *prompt, int n_pr
 
         int32_t one = id;       /* feed the token back to predict the next one */
         quasar_decode(st->ctx, &one, 1, st->logits);
+        if (st->n_cached < st->max_seq) st->cached[st->n_cached] = one;  /* mirror KV */
+        st->n_cached++;
         pos++;
     }
     if (!stop_found && final_len == 0) final_len = text.len;
@@ -493,8 +514,9 @@ static void handle_chat(server_st *st, int fd, const json_value *req) {
     }
 
     double dt = now_s() - t0;
-    fprintf(stderr, "  chat: %d prompt + %d gen tok in %.2fs (%.1f tok/s) finish=%s%s\n",
-            (int)np, n_comp, dt, dt > 0 ? n_comp / dt : 0.0, finish, stream ? " [stream]" : "");
+    fprintf(stderr, "  chat: %d prompt (%d cached, %d prefilled) + %d gen tok in %.2fs (%.1f tok/s) finish=%s%s\n",
+            (int)np, st->last_reused, (int)np - st->last_reused, n_comp, dt,
+            dt > 0 ? n_comp / dt : 0.0, finish, stream ? " [stream]" : "");
 
     free(ids); free(stops); quasar_sampler_free(smp);
 }
@@ -688,9 +710,10 @@ int quasar_serve(const char *model_path, const quasar_server_opts *opts) {
     st.eos = quasar_token_eos(tk);
     st.use_metal = metal_ready;
     st.logits = malloc((size_t)st.n_vocab * sizeof(float));
+    st.cached = malloc((size_t)st.max_seq * sizeof(int32_t));
     if (m->hp.name[0]) snprintf(st.model_id, sizeof st.model_id, "%s", m->hp.name);
     else               snprintf(st.model_id, sizeof st.model_id, "quasar");
-    if (!st.logits) { fprintf(stderr, "quasar: out of memory\n"); quasar_ctx_free(ctx); quasar_tokenizer_free(tk); quasar_model_free(m); return 1; }
+    if (!st.logits || !st.cached) { fprintf(stderr, "quasar: out of memory\n"); quasar_ctx_free(ctx); quasar_tokenizer_free(tk); quasar_model_free(m); return 1; }
 
     /* Warm up: page in the working set and warm the GPU pipelines so the first
      * real request runs at full speed instead of paying cold-start. */
@@ -712,7 +735,7 @@ int quasar_serve(const char *model_path, const quasar_server_opts *opts) {
     }
 
     int lfd = tcp_listen(host, port);
-    if (lfd < 0) { fprintf(stderr, "quasar: cannot bind %s:%d (%s)\n", host, port, strerror(errno)); free(st.logits); quasar_ctx_free(ctx); quasar_tokenizer_free(tk); quasar_model_free(m); return 1; }
+    if (lfd < 0) { fprintf(stderr, "quasar: cannot bind %s:%d (%s)\n", host, port, strerror(errno)); free(st.logits); free(st.cached); quasar_ctx_free(ctx); quasar_tokenizer_free(tk); quasar_model_free(m); return 1; }
 
     fprintf(stderr,
         "quasar: serving \"%s\"\n"
@@ -735,7 +758,7 @@ int quasar_serve(const char *model_path, const quasar_server_opts *opts) {
     }
 
     close(lfd);
-    free(st.logits);
+    free(st.logits); free(st.cached);
     quasar_ctx_free(ctx);
     quasar_tokenizer_free(tk);
     quasar_model_free(m);
